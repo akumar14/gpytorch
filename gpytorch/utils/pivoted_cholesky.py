@@ -4,25 +4,24 @@ import torch
 
 
 def pivoted_cholesky(matrix, max_iter, error_tol=1e-3):
-    from ..lazy import LazyTensor, NonLazyTensor
+    from ..lazy import lazify, LazyTensor
 
     batch_shape = matrix.shape[:-2]
     matrix_shape = matrix.shape[-2:]
 
     # Need to get diagonals. This is easy if it's a LazyTensor, since
     # LazyTensor.diag() operates in batch mode.
-    if isinstance(matrix, LazyTensor):
-        matrix = matrix.evaluate_kernel()
-        matrix_diag = matrix._approx_diag()
-    elif torch.is_tensor(matrix):
-        matrix_diag = NonLazyTensor(matrix).diag()
+    matrix = lazify(matrix)
+    matrix = matrix.evaluate_kernel()
+    matrix_diag = matrix._approx_diag()
 
     # Make sure max_iter isn't bigger than the matrix
     max_iter = min(max_iter, matrix_shape[-1])
 
     # What we're returning
     L = torch.zeros(*batch_shape, max_iter, matrix_shape[-1], dtype=matrix.dtype, device=matrix.device)
-    errors = torch.norm(matrix_diag, 1, dim=-1)
+    orig_error = torch.max(matrix_diag, dim=-1)[0]
+    errors = torch.norm(matrix_diag, 1, dim=-1) / orig_error
 
     # The permutation
     permutation = torch.arange(0, matrix_shape[-1], dtype=torch.long, device=matrix_diag.device)
@@ -38,7 +37,7 @@ def pivoted_cholesky(matrix, max_iter, error_tol=1e-3):
     ]
 
     m = 0
-    while m < max_iter and torch.max(errors) > error_tol:
+    while (m == 0) or (m < max_iter and torch.max(errors) > error_tol):
         permuted_diags = torch.gather(matrix_diag, -1, permutation[..., m:])
         max_diag_values, max_diag_indices = torch.max(permuted_diags, -1)
 
@@ -75,7 +74,7 @@ def pivoted_cholesky(matrix, max_iter, error_tol=1e-3):
             matrix_diag.scatter_(-1, pi_i, matrix_diag_current - L_m_new ** 2)
             L[..., m, :] = L_m
 
-            errors = torch.norm(matrix_diag.gather(-1, pi_i), 1, dim=-1)
+            errors = torch.norm(matrix_diag.gather(-1, pi_i), 1, dim=-1) / orig_error
         m = m + 1
 
     return L[..., :m, :].contiguous()

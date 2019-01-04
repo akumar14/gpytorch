@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 
-import torch
-
 from ..utils.memoize import cached
+from .non_lazy_tensor import lazify
 from .lazy_tensor import LazyTensor
-from .non_lazy_tensor import NonLazyTensor
 from .zero_lazy_tensor import ZeroLazyTensor
 
 
@@ -12,11 +10,10 @@ class SumLazyTensor(LazyTensor):
     def __init__(self, *lazy_tensors):
         lazy_tensors = list(lazy_tensors)
         for i, lazy_tensor in enumerate(lazy_tensors):
-            if not isinstance(lazy_tensor, LazyTensor):
-                if torch.is_tensor(lazy_tensor):
-                    lazy_tensors[i] = NonLazyTensor(lazy_tensor)
-                else:
-                    raise RuntimeError("All arguments of a SumLazyTensor should be LazyTensors or Tensors")
+            try:
+                lazy_tensors[i] = lazify(lazy_tensor)
+            except TypeError:
+                raise TypeError("All arguments of a SumLazyTensor should be LazyTensors or Tensors")
         super(SumLazyTensor, self).__init__(*lazy_tensors)
 
         self.lazy_tensors = lazy_tensors
@@ -50,24 +47,6 @@ class SumLazyTensor(LazyTensor):
     def _transpose_nonbatch(self):
         lazy_tensors_t = [lazy_tensor.transpose(-1, -2) for lazy_tensor in self.lazy_tensors]
         return SumLazyTensor(*lazy_tensors_t)
-
-    def _exact_predictive_covar_inv_quad_form_cache(self, train_train_covar_inv_root, test_train_covar):
-        return tuple(
-            lazy_tensor._exact_predictive_covar_inv_quad_form_cache(
-                train_train_covar_inv_root, test_train_covar_comp
-            ).detach()
-            for lazy_tensor, test_train_covar_comp in zip(self.lazy_tensors, test_train_covar.lazy_tensors)
-        )
-
-    def _exact_predictive_covar_inv_quad_form_root(self, precomputed_cache, test_train_covar):
-        # Here the precomputed cache is a list
-        # where each component in the list is the precomputed cache for each component lazy tensor
-        return sum(
-            lazy_tensor._exact_predictive_covar_inv_quad_form_root(cache_comp, test_train_covar_comp)
-            for lazy_tensor, cache_comp, test_train_covar_comp in zip(
-                self.lazy_tensors, precomputed_cache, test_train_covar.lazy_tensors
-            )
-        )
 
     @cached
     def evaluate(self):

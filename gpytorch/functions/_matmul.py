@@ -22,7 +22,7 @@ class Matmul(Function):
 
         to_save = [orig_rhs] + list(matrix_args)
         self.save_for_backward(*to_save)
-        if not settings.memory_efficient.on():
+        if settings.memory_efficient.off():
             self._lazy_tsr = lazy_tsr
 
         # Squeeze if necessary
@@ -50,7 +50,13 @@ class Matmul(Function):
                 lazy_tsr = self._lazy_tsr
             else:
                 lazy_tsr = self.representation_tree(*matrix_args)
-            rhs_grad = lazy_tsr._t_matmul(grad_output)
+
+            if grad_output.dim() == 1:
+                # Confusing Cublas_Sgemv bug when grad_output is single dimensional on GPU.
+                rhs_grad = lazy_tsr._t_matmul(grad_output.unsqueeze(-1)).squeeze(-1)
+            else:
+                rhs_grad = lazy_tsr._t_matmul(grad_output)
+
             rhs_grad = rhs_grad.view(rhs_shape)
 
         return tuple([rhs_grad] + list(arg_grads))

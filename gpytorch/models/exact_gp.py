@@ -2,11 +2,12 @@
 
 import warnings
 import torch
-from ..functions import exact_predictive_mean, exact_predictive_covar
+from copy import deepcopy
 from ..distributions import MultivariateNormal, MultitaskMultivariateNormal
 from ..likelihoods import _GaussianLikelihoodBase
 from .. import settings
 from .gp import GP
+from .exact_prediction_strategies import prediction_strategy
 
 
 class ExactGP(GP):
@@ -27,8 +28,15 @@ class ExactGP(GP):
             self.train_targets = None
         self.likelihood = likelihood
 
-        self.mean_cache = None
-        self.covar_cache = None
+        self.prediction_strategy = None
+
+    @property
+    def train_targets(self):
+        return self._train_targets
+
+    @train_targets.setter
+    def train_targets(self, value):
+        object.__setattr__(self, '_train_targets', value)
 
     def _apply(self, fn):
         if self.train_inputs is not None:
@@ -52,18 +60,93 @@ class ExactGP(GP):
                 if strict and getattr(targets, attr) != getattr(self.train_targets, attr):
                     raise RuntimeError("Cannot modify {attr} of targets".format(attr=attr))
             self.train_targets = targets
-        self.mean_cache = None
-        self.covar_cache = None
+        self.prediction_strategy = None
+
+    def get_fantasy_model(self, inputs, targets, **kwargs):
+        """
+        Returns a new GP model that incorporates the specified inputs and targets as new training data.
+
+        Using this method is more efficient than updating with `set_train_data` when the number of inputs is relatively
+        small, because any computed test-time caches will be updated in linear time rather than computed from scratch.
+
+        .. note::
+            If `targets` is a batch (e.g. `b x m`), then the GP returned from this method will be a batch mode GP.
+
+        Args:
+            - :attr:`inputs` (Tensor `m x d` or `b x m x d`): Locations of fantasy observations.
+            - :attr:`targets` (Tensor `m` or `b x m`): Labels of fantasy observations.
+        Returns:
+            - :class:`ExactGP`
+                An `ExactGP` model with `n + m` training examples, where the `m` fantasy examples have been added
+                and all test-time caches have been updated.
+        """
+        if self.prediction_strategy is None:
+            raise RuntimeError("Fantasy observations can only be added after making predictions with a model so that "
+                               "all test independent caches exist. Call the model on some data first!")
+
+        if self.train_inputs[0].dim() > 2:
+            raise RuntimeError("Adding fantasy observations to a GP that is already batch mode will not be supported "
+                               "until GPyTorch supports multiple batch dimensions.")
+
+        if self.train_targets.dim() > 1:
+            raise RuntimeError("Cannot yet add fantasy observations to multitask GPs, but this is coming soon!")
+
+        if not isinstance(inputs, list):
+            inputs = [inputs]
+
+        inputs = list(i.unsqueeze(-1) if i.ndimension() == 1 else i for i in inputs)
+
+        # If input is n x d but targets is b x n x d, expand input to b x n x d
+        for i, input in enumerate(inputs):
+            if input.dim() == targets.dim():
+                inputs[i] = input.unsqueeze(0).repeat(*targets.shape[:-1], 1, 1)
+                batch_shape = inputs[i].shape[:-2]
+            elif input.dim() == targets.dim() + 1:
+                batch_shape = input.shape[:-2]
+            elif input.dim() < targets.dim():
+                batch_shape = targets.shape[:-2]
+                inputs[i] = input.expand(*batch_shape, *input.shape[-2:])
+
+        train_inputs = [tin.expand(*batch_shape, *tin.shape[-2:]) for tin in list(self.train_inputs)]
+        train_targets = self.train_targets.expand(*batch_shape, *self.train_targets.shape[-2:])
+
+        full_inputs = [torch.cat([train_input, input], dim=-2) for train_input, input in zip(train_inputs, inputs)]
+        full_targets = torch.cat([train_targets, targets], dim=-1)
+
+        full_output = super(ExactGP, self).__call__(*full_inputs, **kwargs)
+
+        # Copy model without copying training data or prediction strategy (since we'll overwrite those)
+        old_pred_strat = self.prediction_strategy
+        old_train_inputs = self.train_inputs
+        old_train_targets = self.train_targets
+        self.prediction_strategy = None
+        self.train_inputs = None
+        self.train_targets = None
+        new_model = deepcopy(self)
+        self.prediction_strategy = old_pred_strat
+        self.train_inputs = old_train_inputs
+        self.train_targets = old_train_targets
+
+        new_model.train_inputs = full_inputs
+        new_model.train_targets = full_targets
+        new_model.prediction_strategy = old_pred_strat.get_fantasy_strategy(
+            inputs,
+            targets,
+            full_inputs,
+            full_targets,
+            full_output
+        )
+
+        return new_model
 
     def train(self, mode=True):
         if mode:
-            self.mean_cache = None
-            self.covar_cache = None
+            self.prediction_strategy = None
         return super(ExactGP, self).train(mode)
 
     def __call__(self, *args, **kwargs):
         train_inputs = list(self.train_inputs) if self.train_inputs is not None else []
-        inputs = tuple(i.unsqueeze(-1) if i.ndimension() == 1 else i for i in args)
+        inputs = list(i.unsqueeze(-1) if i.ndimension() == 1 else i for i in args)
 
         # Training mode: optimizing
         if self.training:
@@ -78,9 +161,17 @@ class ExactGP(GP):
             res = super(ExactGP, self).__call__(*inputs, **kwargs)
             return res
 
+        # Prior mode
+        elif self.train_inputs is None or self.train_targets is None:
+            full_inputs = args
+            full_output = super(ExactGP, self).__call__(*full_inputs, **kwargs)
+            if settings.debug().on():
+                if not isinstance(full_output, MultivariateNormal):
+                    raise RuntimeError("ExactGP.forward must return a MultivariateNormal")
+            return full_output
         # Posterior mode
         else:
-            if settings.debug.on() and self.train_inputs is not None:
+            if settings.debug.on():
                 if all(torch.equal(train_input, input) for train_input, input in zip(train_inputs, inputs)):
                     warnings.warn(
                         "The input matches the stored training data. Did you forget to call model.train()?", UserWarning
@@ -88,20 +179,24 @@ class ExactGP(GP):
 
             # Exact inference
             non_batch_train = False
-            if self.train_inputs is None:
-                full_inputs = args
-            else:
-                if all(tin.dim() == 2 for tin in self.train_inputs):
-                    # Train inputs were non-batch
-                    non_batch_train = True
-                # If we're doing batch testing, but did std training, adjust the training inputs
-                for i, (train_input, input) in enumerate(zip(train_inputs, inputs)):
-                    if train_input.dim() < input.dim():
-                        train_inputs[i] = train_input.unsqueeze(0).expand(input.size(0), *train_input.size())
 
-                full_inputs = tuple(
-                    torch.cat([train_input, input], dim=-2) for train_input, input in zip(train_inputs, inputs)
-                )
+            if all(tin.dim() == 2 for tin in self.train_inputs):
+                # Train inputs were non-batch
+                non_batch_train = True
+            # Expand train_input to match input's batch size, or vice versa if they don't match.
+            for i, (train_input, input) in enumerate(zip(train_inputs, inputs)):
+                if train_input.dim() < input.dim():
+                    batch_shape = inputs[0].shape[:-2]
+                    train_inputs[i] = train_input.expand(*batch_shape, *train_input.shape[-2:])
+                elif input.dim() < train_input.dim():
+                    batch_shape = train_inputs[0].shape[:-2]
+                    inputs[i] = input.expand(*batch_shape, *input.shape[-2:])
+                else:
+                    batch_shape = train_inputs[0].shape[:-2]
+
+            full_inputs = tuple(
+                torch.cat([train_input, input], dim=-2) for train_input, input in zip(train_inputs, inputs)
+            )
 
             full_output = super(ExactGP, self).__call__(*full_inputs, **kwargs)
             if settings.debug().on():
@@ -109,65 +204,65 @@ class ExactGP(GP):
                     raise RuntimeError("ExactGP.forward must return a MultivariateNormal")
             full_mean, full_covar = full_output.mean, full_output.lazy_covariance_matrix
 
+            train_targets = self.train_targets
+            if any(
+                orig_train_input.dim() < train_input.dim()
+                for orig_train_input, train_input in zip(self.train_inputs, train_inputs)
+            ):
+                train_targets = train_targets.unsqueeze(0).expand(*batch_shape, *train_targets.size())
+
             num_tasks = 1
             if isinstance(full_output, MultitaskMultivariateNormal):
                 num_tasks = full_output.num_tasks
 
-            num_train = 0
-            train_targets = None
-            if self.train_targets is not None:
-                train_targets = self.train_targets
+            full_mean = full_mean.view(*batch_shape, -1)
+            num_train = train_targets.size(len(batch_shape))
+            train_targets = train_targets.view(*batch_shape, -1)
 
-                # If we expanded the train_inputs, we need to do the same for the train_targets
-                if any(
-                    orig_train_input.dim() < train_input.dim()
-                    for orig_train_input, train_input in zip(self.train_inputs, train_inputs)
+            train_mean = full_mean.narrow(-1, 0, train_targets.size(-1))
+
+            if self.prediction_strategy is None:
+                train_train_covar = full_covar[..., :num_train, :num_train].evaluate_kernel()
+                self.prediction_strategy = prediction_strategy(
+                    num_train,
+                    train_inputs,
+                    train_mean,
+                    train_train_covar,
+                    train_targets,
+                    self.likelihood,
+                    non_batch_train,
+                )
+
+            if train_inputs[0].shape != self.prediction_strategy.train_inputs[0].shape:
+                # The test batch shape has changed, update prediction strategy with expanded objects
+                batch_shape = train_inputs[0].shape[:-2]
+                train_train_covar = self.prediction_strategy.train_train_covar
+                if len(batch_shape) > len(train_train_covar.batch_shape):
+                    # Expanding to add more batches
+                    expanded_covar = train_train_covar.expand(*batch_shape, *train_train_covar.matrix_shape)
+                elif (
+                    len(batch_shape) == len(train_train_covar.batch_shape)
+                    and batch_shape.numel() != train_train_covar.batch_shape.numel()
                 ):
-                    train_targets = train_targets.unsqueeze(0).expand(train_inputs[0].size(0), *train_targets.size())
-
-                if num_tasks > 1:
-                    non_batch_train = False
-                    if train_targets.ndimension() == 2:
-                        # Multitask
-                        full_mean = full_mean.view(-1)
-                        num_train = train_targets.size(0)
-                        train_targets = train_targets.view(-1)
-                    else:
-                        # batch mode multitask
-                        batch_size = full_mean.size(0)
-                        full_mean = full_mean.view(batch_size, -1)
-                        num_train = train_targets.size(1)
-                        train_targets = train_targets.view(batch_size, -1)
-                elif train_targets.ndimension() > 1:
-                    # batch mode (standard)
-                    full_mean = full_mean.view(full_mean.size(0), -1)
-                    num_train = train_targets.size(1)
-                    train_targets = train_targets.view(train_targets.size(0), -1)
+                    # The test batch size has changed, we need to repeat it to a new batch size.
+                    expanded_covar = train_train_covar[0].expand(*batch_shape, *train_train_covar.matrix_shape)
                 else:
-                    # non-batch mode (standard)
-                    num_train = train_targets.size(-1)
+                    # We are leaving batch mode, not entering it.
+                    expanded_covar = train_train_covar[0]
+                self.prediction_strategy.train_train_covar = expanded_covar
+                self.prediction_strategy.num_train = num_train
+                self.prediction_strategy.train_targets = train_targets
+                self.prediction_strategy.train_inputs = train_inputs
+                self.prediction_strategy.train_mean = train_mean
+                self.prediction_strategy.non_batch_train = non_batch_train
 
-            predictive_mean, mean_cache = exact_predictive_mean(
-                full_covar=full_covar,
-                full_mean=full_mean,
-                train_inputs=train_inputs,
-                train_labels=train_targets,
-                num_train=num_train,
-                likelihood=self.likelihood,
-                precomputed_cache=self.mean_cache,
-                non_batch_train=non_batch_train,
-            )
-            predictive_covar, covar_cache = exact_predictive_covar(
-                full_covar=full_covar,
-                train_inputs=train_inputs,
-                num_train=num_train,
-                likelihood=self.likelihood,
-                precomputed_cache=self.covar_cache,
-                non_batch_train=non_batch_train,
-            )
+            test_mean = full_mean.narrow(-1, train_targets.size(-1), full_mean.size(-1) - train_targets.size(-1))
+            test_test_covar = full_covar[..., num_train:, num_train:]
+            test_train_covar = full_covar[..., num_train:, :num_train]
 
-            self.mean_cache = mean_cache
-            self.covar_cache = covar_cache
+            predictive_mean = self.prediction_strategy.exact_predictive_mean(test_mean, test_train_covar)
+            predictive_covar = self.prediction_strategy.exact_predictive_covar(test_test_covar, test_train_covar)
+
             if num_tasks > 1:
                 if train_targets.ndimension() == 2:
                     # Batch multitask

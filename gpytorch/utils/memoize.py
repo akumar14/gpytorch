@@ -3,13 +3,18 @@
 import functools
 
 
-def cached(f):
-    """A simple caching decorator for instance functions not taking any arguments"""
+def cached(method=None, name=None):
+    """A decorator allowing for specifying the name of a cache, allowing it to be modified elsewhere."""
+    if method is None:
+        return functools.partial(cached, name=name)
 
-    @functools.wraps(f)
-    def g(self):
+    @functools.wraps(method)
+    def g(self, *args, **kwargs):
         if not hasattr(self, "__cache"):
-            self.__cache = f(self)
-        return self.__cache
+            self.__cache = dict()
+        cache_name = name if name is not None else method
+        if cache_name not in self.__cache:
+            self.__cache[cache_name] = method(self, *args, **kwargs)
+        return self.__cache[cache_name]
 
     return g

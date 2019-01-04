@@ -3,7 +3,7 @@
 [![Documentation Status](https://readthedocs.org/projects/gpytorch/badge/?version=latest)](https://gpytorch.readthedocs.io/en/latest/?badge=latest)
 
 **News!**
- - The Beta release is currently out! Note that it **requires the PyTorch preview build** (pytorch-nightly, >= 1.0).
+ - The Beta release is currently out! Note that it **requires PyTorch >= 1.0.0**
  - If you need to install the alpha release (we recommend you use the latest version though!), check out [the alpha release](https://github.com/cornellius-gp/gpytorch/tree/alpha).
 
 GPyTorch is a Gaussian process library implemented using PyTorch. GPyTorch is designed for creating scalable, flexible, and modular Gaussian process models with ease. 
@@ -14,7 +14,7 @@ GPyTorch provides (1) significant GPU acceleration (through MVM based inference)
 
 ## Examples and Tutorials
 
-See our numerous [**examples and tutorials**](http://github.com/cornellius-gp/gpytorch/blob/master/examples) on how to construct all sorts of models in GPyTorch. These example notebooks and a walk through of GPyTorch are also available at our **ReadTheDocs page [here](https://gpytorch.readthedocs.io/en/latest/index.html)**
+See our numerous [**examples and tutorials**](http://github.com/cornellius-gp/gpytorch/blob/master/examples) on how to construct all sorts of models in GPyTorch. These example notebooks and a walk through of GPyTorch are also available at our **ReadTheDocs page [here](https://gpytorch.readthedocs.io/en/latest/index.html)**.
 
 ## Installation
 
@@ -24,7 +24,7 @@ See our numerous [**examples and tutorials**](http://github.com/cornellius-gp/gp
 
 **N.B.** GPyTorch will not run on PyTorch 0.4.1 or earlier versions.
 
-The easiest way to install GPyTorch is by installing the **nightly PyTorch build** (`pytorch-nightly >= 1.0.0`) using the appropriate command from [here](https://pytorch.org/get-started/locally/).
+First make sure that you have PyTorch (`>= 1.0.0`) installed using the appropriate command from [here](https://pytorch.org/get-started/locally/).
 
 Then install GPyTorch using pip:
 
@@ -45,14 +45,12 @@ pip install git+https://github.com/cornellius-gp/gpytorch.git
 ## Citing Us
 
 If you use GPyTorch, please cite the following papers:
-> [Gardner, Jacob R., Geoff Pleiss, David Bindel, Kilian Q. Weinberger, and Andrew Gordon Wilson. "
-GPyTorch: Blackbox Matrix-Matrix Gaussian Process Inference with GPU Acceleration." In *NeurIPS* (2018).](https://arxiv.org/abs/1809.11165)
+> [Gardner, Jacob R., Geoff Pleiss, David Bindel, Kilian Q. Weinberger, and Andrew Gordon Wilson. "GPyTorch: Blackbox Matrix-Matrix Gaussian Process Inference with GPU Acceleration." In Advances in Neural Information Processing Systems (2018).](https://arxiv.org/abs/1809.11165)
 ```
 @inproceedings{gardner2018gpytorch,
-  title={
-GPyTorch: Blackbox Matrix-Matrix Gaussian Process Inference with GPU Acceleration},
+  title={GPyTorch: Blackbox Matrix-Matrix Gaussian Process Inference with GPU Acceleration},
   author={Gardner, Jacob R and Pleiss, Geoff and Bindel, David and Weinberger, Kilian Q and Wilson, Andrew Gordon},
-  booktitle={NeurIPS},
+  booktitle={Advances in Neural Information Processing Systems},
   year={2018}
 }
 ```

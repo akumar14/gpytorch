@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 
 import math
-
+import warnings
 import gpytorch
 import torch
 
-from .. import beta_features, settings
+from .. import settings
 from ..functions._inv_matmul import InvMatmul
 from ..functions._inv_quad_log_det import InvQuadLogDet
 from ..functions._matmul import Matmul
 from ..functions._root_decomposition import RootDecomposition
+from ..utils import linear_cg
 from ..utils.broadcasting import _matmul_broadcast_shape
 from ..utils.memoize import cached
 from ..utils.qr import batch_qr
@@ -66,7 +67,7 @@ class LazyTensor(object):
         operate on these batches if present.
     """
 
-    def _get_indices(self, *batch_indices, left_indices, right_indices):
+    def _get_indices(self, left_indices, right_indices, *batch_indices):
         """
         Returns entries of the matrix, indexed by batch, row, and column indices
         """
@@ -90,6 +91,19 @@ class LazyTensor(object):
             :obj:`torch.tensor`: matrix * rhs
         """
         raise NotImplementedError("The class {} requires a _matmul function!".format(self.__class__.__name__))
+
+    def _probe_vectors_and_norms(self):
+        return None, None
+
+    def _solve(self, rhs, preconditioner, num_tridiag=None):
+        return linear_cg(
+            self._matmul,
+            rhs,
+            n_tridiag=num_tridiag,
+            max_iter=settings.max_cg_iterations.value(),
+            max_tridiag_iter=settings.max_lanczos_quadrature_iterations.value(),
+            preconditioner=preconditioner
+        )
 
     def _size(self):
         """
@@ -144,36 +158,6 @@ class LazyTensor(object):
         """
         return self.diag()
 
-    def _exact_predictive_covar_inv_quad_form_cache(self, train_train_covar_inv_root, test_train_covar):
-        """
-        Computes a cache for K_X*X (K_XX + sigma^2 I)^-1 K_X*X if possible. By default, this does no work and returns
-        the first argument.
-
-        Args:
-            train_train_covar_inv_root (:obj:`torch.tensor`): a root of (K_XX + sigma^2 I)^-1
-            test_train_covar (:obj:`torch.tensor`): the observed noise (from the likelihood)
-
-        Returns
-            - A precomputed cache
-        """
-        return train_train_covar_inv_root.detach()
-
-    def _exact_predictive_covar_inv_quad_form_root(self, precomputed_cache, test_train_covar):
-        """
-        Computes :math:`K_{X^{*}X} S` given a precomputed cache
-        Where :math:`S` is a tensor such that :math:`SS^{\\top} = (K_{XX} + \sigma^2 I)^{-1}`
-
-        Args:
-            precomputed_cache (:obj:`torch.tensor`): What was computed in _exact_predictive_covar_inv_quad_form_cache
-            test_train_covar (:obj:`torch.tensor`): The observed noise (from the likelihood)
-
-        Returns
-            :obj:`~gpytorch.lazy.LazyTensor`: :math:`K_{X^{*}X} S`
-        """
-        # Here the precomputed cache represents S,
-        # where S S^T = (K_XX + sigma^2 I)^-1
-        return test_train_covar.matmul(precomputed_cache)
-
     def _getitem(self, *indices):
         """
         Supports subindexing of the matrix this LazyTensor represents. This may return either another
@@ -188,14 +172,14 @@ class LazyTensor(object):
             which does some additional work. Calling this method directly is discouraged.
 
         Args:
-            :attr:`indices` (tuple of int, slice, or LongTensor):
+            :attr:`indices` (tuple of `int`s, `slice`s, or `LongTensor`s):
                 A collection of indices for each of the dimensions. There will be exactly one index per dimension.
         """
         if settings.debug.on():
             if len(indices) != self.dim():
                 raise RuntimeError(
-                    f"{self.__class__.__name__}._getitem() called with {len(indices)} indices - expected {self.dim()}. "
-                    "This is potentially a bug in GPyTorch."
+                    "{}._getitem() called with {} indices - expected {}. "
+                    "This is potentially a bug in GPyTorch.".format(self.__class__.__name__, len(indices), self.dim())
                 )
 
         components = list(self._args)
@@ -389,21 +373,28 @@ class LazyTensor(object):
             :obj:`torch.tensor`: derivative with respect to the arguments that are actually used to represent this
                                    this LazyTensor.
         """
-        args = self.representation()
+        from collections import deque
 
-        toggled = [False] * len(args)
+        args = tuple(self.representation())
+        args_with_grads = tuple(arg for arg in args if arg.requires_grad)
 
-        for i, arg in enumerate(args):
-            if not arg.requires_grad:
-                arg.requires_grad = True
-                toggled[i] = True
+        # Easy case: if we don't require any gradients, then just return!
+        if not len(args_with_grads):
+            return tuple(None for _ in args)
 
-        loss = (left_vecs * self._matmul(right_vecs)).sum()
-        grads = torch.autograd.grad(loss, args)
+        # Normal case: we'll use the autograd to get us a derivative
+        with torch.autograd.enable_grad():
+            loss = (left_vecs * self._matmul(right_vecs)).sum()
+            loss.requires_grad_(True)
+            actual_grads = deque(torch.autograd.grad(loss, args_with_grads, allow_unused=True))
 
-        for i, arg in enumerate(args):
-            if toggled[i]:
-                arg.requires_grad = False
+        # Now make sure that the object we return has one entry for every item in args
+        grads = []
+        for arg in args:
+            if arg.requires_grad:
+                grads.append(actual_grads.popleft())
+            else:
+                grads.append(None)
 
         return grads
 
@@ -550,6 +541,26 @@ class LazyTensor(object):
     def device(self):
         return self._args[0].device
 
+    def detach(self):
+        """
+        Removes the LazyTensor from the current computation graph.
+        (In practice, this function removes all Tensors that make up the
+        LazyTensor from the computation graph.)
+        """
+        return self.clone().detach_()
+
+    def detach_(self):
+        """
+        An in-place version of `detach`.
+        """
+        for arg in self._args:
+            if hasattr(arg, "detach"):
+                arg.detach_()
+        for val in self._kwargs.values():
+            if hasattr(val, "detach"):
+                val.detach_()
+        return self
+
     def diag(self):
         """
         As :func:`torch.diag`, returns the diagonal of the matrix :math:`K` this LazyTensor represents as a vector.
@@ -620,133 +631,36 @@ class LazyTensor(object):
         """
         return self.representation_tree()(*self.representation())
 
-    def exact_predictive_mean(
-        self,
-        full_mean,
-        train_inputs,
-        train_labels,
-        num_train,
-        likelihood,
-        precomputed_cache=None,
-        non_batch_train=False,
-    ):
+    def inv_matmul(self, right_tensor, left_tensor=None):
         """
-        Computes the posterior predictive covariance of a GP
-        Assumes that self is the block prior covariance matrix of training and testing points
-        [ K_XX, K_XX*; K_X*X, K_X*X* ]
+        Computes a linear solve (w.r.t self = :math:`A`) with several right hand sides :math:`R`.
+        I.e. computes
+
+        ... math::
+
+            \begin{equation}
+                A^{-1} R,
+            \end{equation}
+
+        where :math:`R` is :attr:`right_tensor` and :math:`A` is the LazyTensor.
+
+        If :attr:`left_tensor` is supplied, computes
+
+        ... math::
+
+            \begin{equation}
+                L A^{-1} R,
+            \end{equation}
+
+        where :math:`L` is :attr:`left_tensor`. Supplying this can reduce the number of
+        CG calls required.
 
         Args:
-            full_mean (:obj:`torch.tensor`): the training and test prior means, stacked on top of each other
-            train_inputs (:obj:`torch.tensor`): The training data inputs
-            train_labels (:obj:`torch.tensor`): the training labels minus the training prior mean
-            noise (:obj:`torch.tensor`): the observed noise (from the likelihood)
-            precomputed_cache (optional): speeds up subsequent computations (default: None)
+            - :obj:`torch.tensor` (n x k) - Matrix :math:`R` right hand sides
+            - :obj:`torch.tensor` (m x n) - Optional matrix :math:`L` to perform left multiplication with
 
         Returns:
-            :obj:`torch.tensor`: The predictive posterior mean of the test points
-        """
-        from ..distributions import MultivariateNormal
-
-        if precomputed_cache is None:
-            train_mean = full_mean.narrow(-1, 0, num_train)
-            if non_batch_train and self.dim() == 3:
-                train_train_covar = self[0, :num_train, :num_train]
-            else:
-                train_train_covar = self[..., :num_train, :num_train]
-
-            train_mean = full_mean.narrow(-1, 0, train_train_covar.size(-1))
-            if non_batch_train and train_mean.dim() == 2:
-                train_mean = train_mean[0]
-                train_labels = train_labels[0]
-            mvn = likelihood(MultivariateNormal(train_mean, train_train_covar), train_inputs)
-
-            train_mean, train_train_covar = mvn.mean, mvn.lazy_covariance_matrix
-
-            train_labels_offset = train_labels - train_mean
-
-            if self.dim() == 3:
-                # Batch mode
-                train_labels_offset = train_labels_offset.unsqueeze(-1)
-                precomputed_cache = train_train_covar.inv_matmul(train_labels_offset).squeeze(-1)
-            else:
-                # Standard mode
-                precomputed_cache = train_train_covar.inv_matmul(train_labels_offset)
-
-        test_mean = full_mean.narrow(-1, train_labels.size(-1), full_mean.size(-1) - train_labels.size(-1))
-
-        if self.dim() == 3:
-            test_train_covar = self[:, num_train:, :num_train]
-            res = test_train_covar.matmul(precomputed_cache.unsqueeze(-1)).squeeze(-1)
-        else:
-            test_train_covar = self[num_train:, :num_train]
-            if non_batch_train and precomputed_cache.dim() == 2:
-                precomputed_cache = precomputed_cache[0]
-            res = test_train_covar.matmul(precomputed_cache)
-
-        res = res + test_mean
-
-        return res, precomputed_cache.detach()
-
-    def exact_predictive_covar(
-        self, train_inputs, num_train, likelihood, precomputed_cache=None, non_batch_train=False
-    ):
-        """
-        Computes the posterior predictive covariance of a GP
-        Assumes that self is the block prior covariance matrix of training and testing points
-        [ K_XX, K_XX*; K_X*X, K_X*X* ]
-
-        Args:
-            train_inputs (:obj:`torch.tensor`): The training data inputs
-            num_train (int): The number of training points in the full covariance matrix
-            noise (scalar): The observed noise (from the likelihood)
-            precomputed_cache (optional): speeds up subsequent computations (default: None)
-
-        Returns:
-            :obj:`gpytorch.lazy.LazyTensor`: A LazyTensor representing the predictive posterior covariance of the
-                                               test points
-        """
-        from ..distributions import MultivariateNormal
-
-        train_train_covar = self[..., :num_train, :num_train]
-        test_train_covar = self[..., num_train:, :num_train]
-        test_test_covar = self[..., num_train:, num_train:]
-
-        train_train_covar = likelihood(
-            MultivariateNormal(torch.zeros(1), train_train_covar), train_inputs
-        ).lazy_covariance_matrix
-        if not beta_features.fast_pred_var.on():
-            from .matmul_lazy_tensor import MatmulLazyTensor
-
-            test_train_covar = test_train_covar.evaluate()
-            train_test_covar = test_train_covar.transpose(-1, -2)
-            covar_correction_rhs = train_train_covar.inv_matmul(train_test_covar).mul(-1)
-            res = test_test_covar + MatmulLazyTensor(test_train_covar, covar_correction_rhs)
-            return res, None
-
-        if precomputed_cache is None:
-            if non_batch_train and train_train_covar.dim() == 3:
-                train_train_covar_inv_root = train_train_covar[0].root_inv_decomposition().root.evaluate()
-            else:
-                train_train_covar_inv_root = train_train_covar.root_inv_decomposition().root.evaluate()
-            precomputed_cache = self._exact_predictive_covar_inv_quad_form_cache(
-                train_train_covar_inv_root, test_train_covar
-            )
-
-        from .root_lazy_tensor import RootLazyTensor
-
-        covar_inv_quad_form_root = self._exact_predictive_covar_inv_quad_form_root(precomputed_cache, test_train_covar)
-        res = test_test_covar + RootLazyTensor(covar_inv_quad_form_root).mul(-1)
-        return res, precomputed_cache
-
-    def inv_matmul(self, tensor):
-        """
-        Computes a linear solve (w.r.t self = :math:`K`) with several right hand sides :math:`M`.
-
-        Args:
-            - :obj:`torch.tensor` (n x k) - Matrix :math:`M` right hand sides
-
-        Returns:
-            - :obj:`torch.tensor` - :math:`K^{-1}M`
+            - :obj:`torch.tensor` - :math:`A^{-1}R` or :math:`LA^{-1}R`.
         """
         if not self.is_square:
             raise RuntimeError(
@@ -754,18 +668,24 @@ class LazyTensor(object):
                 "Got a {} of size {}.".format(self.__class__.__name__, self.size())
             )
 
-        if self.dim() == 2 and tensor.dim() == 1:
-            if self.shape[-1] != tensor.numel():
+        if self.dim() == 2 and right_tensor.dim() == 1:
+            if self.shape[-1] != right_tensor.numel():
                 raise RuntimeError(
                     "LazyTensor (size={}) cannot be multiplied with right-hand-side Tensor (size={}).".format(
-                        self.shape, tensor.shape
+                        self.shape, right_tensor.shape
                     )
                 )
 
-        func = InvMatmul(self.representation_tree(), preconditioner=self._inv_matmul_preconditioner())
-        return func(tensor, *self.representation())
+        func = InvMatmul(
+            self.representation_tree(), preconditioner=self._inv_matmul_preconditioner(),
+            has_left=(left_tensor is not None)
+        )
+        if left_tensor is None:
+            return func(right_tensor, *self.representation())
+        else:
+            return func(left_tensor, right_tensor, *self.representation())
 
-    def inv_quad(self, tensor):
+    def inv_quad(self, tensor, reduce_inv_quad=True):
         """
         Computes an inverse quadratic form (w.r.t self) with several right hand sides.
         I.e. computes tr( tensor^T self^{-1} tensor )
@@ -779,7 +699,7 @@ class LazyTensor(object):
         Returns:
             - tensor - tr( tensor^T (self)^{-1} tensor )
         """
-        res, _ = self.inv_quad_log_det(inv_quad_rhs=tensor, log_det=False)
+        res, _ = self.inv_quad_log_det(inv_quad_rhs=tensor, log_det=False, reduce_inv_quad=reduce_inv_quad)
         return res
 
     def inv_quad_log_det(self, inv_quad_rhs=None, log_det=False, reduce_inv_quad=True):
@@ -825,6 +745,7 @@ class LazyTensor(object):
         if inv_quad_rhs is not None:
             args = [inv_quad_rhs] + list(args)
 
+        probe_vectors, probe_vector_norms = self._probe_vectors_and_norms()
         inv_quad_term, log_det_term = InvQuadLogDet(
             representation_tree=self.representation_tree(),
             matrix_shape=self.matrix_shape,
@@ -835,6 +756,8 @@ class LazyTensor(object):
             log_det=log_det,
             preconditioner=self._preconditioner()[0],
             log_det_correction=self._preconditioner()[1],
+            probe_vectors=probe_vectors,
+            probe_vector_norms=probe_vector_norms,
         )(*args)
 
         if inv_quad_term.numel() and reduce_inv_quad:
@@ -1059,6 +982,29 @@ class LazyTensor(object):
         """
         return LazyTensorRepresentationTree(self)
 
+    @property
+    def requires_grad(self):
+        return any(arg.requires_grad for arg in tuple(self._args) + tuple(self._kwargs.values()))
+
+    @requires_grad.setter
+    def requires_grad(self, val):
+        for arg in self._args:
+            if hasattr(arg, "requires_grad"):
+                if arg.dtype in (torch.float, torch.double, torch.half):
+                    arg.requires_grad = val
+        for arg in self._kwargs.values():
+            if hasattr(arg, "requires_grad"):
+                arg.requires_grad = val
+
+    def requires_grad_(self, val):
+        """
+        Sets `requires_grad=val` on all the Tensors that make up the LazyTensor
+        This is an inplace operation.
+        """
+        self.requires_grad = val
+        return self
+
+    @cached(name="root_decomposition")
     def root_decomposition(self):
         """
         Returns a (usually low-rank) root decomposotion lazy tensor of a PSD matrix.
@@ -1066,20 +1012,21 @@ class LazyTensor(object):
         low-rank version of a matrix
         """
         from .root_lazy_tensor import RootLazyTensor
-
         if not self.is_square:
             raise RuntimeError(
                 "root_decomposition only operates on (batches of) square (symmetric) LazyTensors. "
                 "Got a {} of size {}.".format(self.__class__.__name__, self.size())
             )
 
-        # when dealing with small matrices, it's usually faster to use Choleksy decomposition
-        if self.matrix_shape.numel() <= (settings.max_cholesky_numel.value()):
+        if (self.matrix_shape.numel() <= settings.max_cholesky_numel.value()
+                or settings.fast_computations.covar_root_decomposition.off()):
             try:
                 res = torch.cholesky(self.evaluate())
                 return RootLazyTensor(res)
-            except RuntimeError:
-                pass
+            except RuntimeError as e:
+                warnings.warn(
+                    "Runtime Error when computing Cholesky decomposition: {}. Using RootDecomposition.".format(e)
+                )
 
         res, _ = RootDecomposition(
             self.representation_tree(),
@@ -1089,8 +1036,10 @@ class LazyTensor(object):
             batch_shape=self.batch_shape,
             matrix_shape=self.matrix_shape,
         )(*self.representation())
+
         return RootLazyTensor(res)
 
+    @cached
     def root_inv_decomposition(self, initial_vectors=None, test_vectors=None):
         """
         Returns a (usually low-rank) root decomposotion lazy tensor of a PSD matrix.
@@ -1136,6 +1085,11 @@ class LazyTensor(object):
             inverse=True,
             initial_vectors=initial_vectors,
         )(*self.representation())
+
+        if initial_vectors is not None and initial_vectors.size(-1) > 1:
+            getattr(self, '__cache')["root_decomposition"] = RootLazyTensor(roots[0])
+        else:
+            getattr(self, '__cache')["root_decomposition"] = RootLazyTensor(roots)
 
         # Choose the best of the inv_roots, if there were more than one initial vectors
         if initial_vectors is not None and initial_vectors.size(-1) > 1:
@@ -1369,6 +1323,7 @@ class LazyTensor(object):
         # Process the index
         index = index if isinstance(index, tuple) else (index,)
         index = tuple(torch.tensor(idx) if isinstance(idx, list) else idx for idx in index)
+        index = tuple(idx.item() if torch.is_tensor(idx) and not len(idx.shape) else idx for idx in index)
 
         # Handle the ellipsis
         # Find the index of the ellipsis
@@ -1427,3 +1382,25 @@ def _import_dotted_name(name):
     for component in components[1:]:
         obj = getattr(obj, component)
     return obj
+
+
+def delazify(obj):
+    """
+    A function which ensures that `obj` is a (normal) Tensor.
+
+    If `obj` is a Tensor, this function does nothing.
+    If `obj` is a LazyTensor, this function evaluates it.
+    """
+
+    if torch.is_tensor(obj):
+        return obj
+    elif isinstance(obj, LazyTensor):
+        return obj.evaluate()
+    else:
+        raise TypeError("object of class {} cannot be made into a Tensor".format(obj.__class__.__name__))
+
+
+__all__ = [
+    "LazyTensor",
+    "delazify",
+]

@@ -7,7 +7,8 @@ from torch.distributions import MultivariateNormal as TMultivariateNormal
 from torch.distributions.kl import register_kl
 from torch.distributions.utils import _standard_normal, lazy_property
 
-from ..lazy import LazyTensor, NonLazyTensor
+from .. import settings
+from ..lazy import LazyTensor, lazify
 from .distribution import Distribution
 
 
@@ -47,7 +48,9 @@ class _MultivariateNormalBase(TMultivariateNormal, Distribution):
     def _unbroadcasted_scale_tril(self):
         if self.islazy and self.__unbroadcasted_scale_tril is None:
             # cache root decoposition
-            self.__unbroadcasted_scale_tril = self.lazy_covariance_matrix.root_decomposition()
+            with settings.fast_computations(covar_root_decomposition=False):
+                ust = self.lazy_covariance_matrix.root_decomposition().root.evaluate()
+            self.__unbroadcasted_scale_tril = ust
         return self.__unbroadcasted_scale_tril
 
     @_unbroadcasted_scale_tril.setter
@@ -100,7 +103,7 @@ class _MultivariateNormalBase(TMultivariateNormal, Distribution):
         if self.islazy:
             return self._covar
         else:
-            return NonLazyTensor(super(_MultivariateNormalBase, self).covariance_matrix)
+            return lazify(super(_MultivariateNormalBase, self).covariance_matrix)
 
     def log_prob(self, value):
         if self._validate_args:
@@ -222,7 +225,7 @@ except ImportError:
 @register_kl(MultivariateNormal, MultivariateNormal)
 def kl_mvn_mvn(p_dist, q_dist):
     q_mean = q_dist.loc
-    q_covar = q_dist.lazy_covariance_matrix.add_jitter()
+    q_covar = q_dist.lazy_covariance_matrix
 
     p_mean = p_dist.loc
     p_covar = p_dist.lazy_covariance_matrix
@@ -233,7 +236,7 @@ def kl_mvn_mvn(p_dist, q_dist):
         # right now this just catches if root_p_covar is a DiagLazyTensor,
         # but we may want to be smarter about this in the future
         root_p_covar = root_p_covar.evaluate()
-    inv_quad_rhs = torch.cat([root_p_covar, mean_diffs.unsqueeze(-1)], -1)
+    inv_quad_rhs = torch.cat([mean_diffs.unsqueeze(-1), root_p_covar], -1)
     log_det_p_covar = p_covar.log_det()
     trace_plus_inv_quad_form, log_det_q_covar = q_covar.inv_quad_log_det(inv_quad_rhs=inv_quad_rhs, log_det=True)
 

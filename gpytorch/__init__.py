@@ -15,13 +15,10 @@ from . import (
     utils,
     variational,
 )
-from .beta_features import fast_pred_var
 from .functions import (
     add_diag,
     add_jitter,
     dsmm,
-    exact_predictive_covar,
-    exact_predictive_mean,
     inv_matmul,
     inv_quad,
     inv_quad_log_det,
@@ -33,6 +30,11 @@ from .functions import (
     root_inv_decomposition,
 )
 from .mlls import ExactMarginalLogLikelihood, VariationalMarginalLogLikelihood
+from .lazy import lazify, delazify
+
+
+# Old deprecated stuff
+fast_pred_var = beta_features._moved_beta_feature(settings.fast_pred_var, "gpytorch.settings.fast_pred_var")
 
 
 __all__ = [
@@ -54,12 +56,12 @@ __all__ = [
     # Functions
     "add_diag",
     "add_jitter",
+    "delazify",
     "dsmm",
-    "exact_predictive_mean",
-    "exact_predictive_covar",
     "inv_matmul",
     "inv_quad",
     "inv_quad_log_det",
+    "lazify",
     "log_det",
     "log_normal_cdf",
     "matmul",

@@ -5,6 +5,7 @@ from .kernel import Kernel
 from ..utils.deprecation import _deprecate_kwarg
 from ..utils.transforms import _get_inv_param_transform
 from torch.nn.functional import softplus
+from ..lazy import delazify
 
 
 class ScaleKernel(Kernel):
@@ -87,12 +88,17 @@ class ScaleKernel(Kernel):
             value = torch.tensor(value)
         self.initialize(raw_outputscale=self._inv_param_transform(value))
 
-    def forward(self, x1, x2, batch_dims=None, **params):
+    def forward(self, x1, x2, batch_dims=None, diag=False, **params):
         outputscales = self.outputscale
         if batch_dims == (0, 2) and outputscales.numel() > 1:
             outputscales = outputscales.unsqueeze(1).repeat(1, x1.size(-1)).view(-1)
 
-        orig_output = self.base_kernel(x1, x2, batch_dims=batch_dims, **params)
+        orig_output = self.base_kernel.forward(x1, x2, diag=diag, batch_dims=batch_dims, **params)
+
         if torch.is_tensor(orig_output):
             outputscales = outputscales.view(-1, *([1] * (orig_output.dim() - 1)))
+
+        if diag:
+            return delazify(orig_output) * outputscales
+
         return orig_output.mul(outputscales)

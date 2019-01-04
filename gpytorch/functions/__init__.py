@@ -20,12 +20,8 @@ def add_diag(input, diag):
     Returns:
         :obj:`Tensor` (bxnxn or nxn)
     """
-    if torch.is_tensor(input):
-        from ..lazy import NonLazyTensor
-
-        return NonLazyTensor(input).add_diag(diag)
-    else:
-        return input.add_diag(diag)
+    from ..lazy import lazify
+    return lazify(input).add_diag(diag)
 
 
 def add_jitter(mat, jitter_val=1e-3):
@@ -63,71 +59,6 @@ def dsmm(sparse_mat, dense_mat):
     return DSMM(sparse_mat)(dense_mat)
 
 
-def exact_predictive_mean(
-    full_covar,
-    full_mean,
-    train_inputs,
-    train_labels,
-    num_train,
-    likelihood,
-    precomputed_cache=None,
-    non_batch_train=False,
-):
-    """
-    Computes the posterior predictive mean of a GP
-
-    Args:
-        - full_covar ( (n+t) x (n+t) ) - the block prior covariance matrix of training and testing points
-            [ K_XX, K_XX*; K_X*X, K_X*X* ]
-        - full_mean (n + t) - the training and test prior means, stacked on top of each other
-        - train_inputs (:obj:`torch.tensor`) -  The training data inputs
-        - train_labels (n) - the training labels minus the training prior mean
-        - noise (1) - the observed noise (from the likelihood)
-        - precomputed_cache - speeds up subsequent computations (default: None)
-
-    Returns:
-        - (t) - the predictive posterior mean of the test points
-    """
-    if not num_train:
-        return full_mean, None
-
-    if not hasattr(full_covar, "exact_predictive_mean"):
-        from ..lazy.non_lazy_tensor import NonLazyTensor
-
-        full_covar = NonLazyTensor(full_covar)
-    return full_covar.exact_predictive_mean(
-        full_mean, train_inputs, train_labels, num_train, likelihood, precomputed_cache, non_batch_train
-    )
-
-
-def exact_predictive_covar(
-    full_covar, train_inputs, num_train, likelihood, precomputed_cache=None, non_batch_train=False
-):
-    """
-    Computes the posterior predictive covariance of a GP
-
-    Args:
-        - full_covar ( (n+t) x (n+t) ) - the block prior covariance matrix of training and testing points
-            [ K_XX, K_XX*; K_X*X, K_X*X* ]
-        - train_inputs TODO
-        - num_train (int) - how many training points are there in the full covariance matrix
-        - noise (1) - the observed noise (from the likelihood)
-        - precomputed_cache - speeds up subsequent computations (default: None)
-
-    Returns:
-        - LazyTensor (t x t) - the predictive posterior covariance of the test points
-    """
-    if not num_train:
-        return full_covar, None
-
-    if not hasattr(full_covar, "exact_predictive_covar"):
-        from ..lazy.non_lazy_tensor import NonLazyTensor
-
-        full_covar = NonLazyTensor(full_covar)
-
-    return full_covar.exact_predictive_covar(train_inputs, num_train, likelihood, precomputed_cache, non_batch_train)
-
-
 def log_normal_cdf(x):
     """
     Computes the element-wise log standard normal CDF of an input tensor x.
@@ -154,23 +85,39 @@ def matmul(mat, rhs):
     return mat.matmul(rhs)
 
 
-def inv_matmul(mat, rhs):
-    """
-    Computes a linear solve with several right hand sides.
+def inv_matmul(mat, right_tensor, left_tensor=None):
+    r"""
+    Computes a linear solve (w.r.t :attr:`mat` = :math:`A`) with several right hand sides :math:`R`.
+    I.e. computes
+
+    ... math::
+
+        \begin{equation}
+            A^{-1} R,
+        \end{equation}
+
+    where :math:`R` is :attr:`right_tensor` and :math:`A` is :attr:`mat`.
+
+    If :attr:`left_tensor` is supplied, computes
+
+    ... math::
+
+        \begin{equation}
+            L A^{-1} R,
+        \end{equation}
+
+    where :math:`L` is :attr:`left_tensor`. Supplying this can reduce the number of
+    CG calls required.
 
     Args:
-        - mat (matrix nxn) - Matrix to solve with
-        - rhs (matrix nxk) - rhs matrix or vector
+        - :obj:`torch.tensor` (n x k) - Matrix :math:`R` right hand sides
+        - :obj:`torch.tensor` (m x n) - Optional matrix :math:`L` to perform left multiplication with
 
     Returns:
-        - matrix nxk - (mat)^{-1} rhs
+        - :obj:`torch.tensor` - :math:`A^{-1}R` or :math:`LA^{-1}R`.
     """
-    if hasattr(mat, "inv_matmul"):
-        return mat.inv_matmul(rhs)
-    else:
-        from ..lazy.non_lazy_tensor import NonLazyTensor
-
-        return NonLazyTensor(mat).inv_matmul(rhs)
+    from ..lazy import lazify
+    return lazify(mat).inv_matmul(right_tensor, left_tensor)
 
 
 def inv_quad(mat, tensor):
@@ -201,12 +148,8 @@ def inv_quad_log_det(mat, inv_quad_rhs=None, log_det=False, reduce_inv_quad=True
         - scalar - tr( tensor^T (mat)^{-1} tensor )
         - scalar - log determinant
     """
-    if hasattr(mat, "inv_quad_log_det"):
-        return mat.inv_quad_log_det(inv_quad_rhs, log_det, reduce_inv_quad=reduce_inv_quad)
-    else:
-        from ..lazy.non_lazy_tensor import NonLazyTensor
-
-        return NonLazyTensor(mat).inv_quad_log_det(inv_quad_rhs, log_det, reduce_inv_quad=reduce_inv_quad)
+    from ..lazy import lazify
+    return lazify(mat).inv_quad_log_det(inv_quad_rhs, log_det, reduce_inv_quad=reduce_inv_quad)
 
 
 def log_det(mat):
@@ -233,12 +176,8 @@ def root_decomposition(mat):
     This can be used for sampling from a Gaussian distribution, or for obtaining a
     low-rank version of a matrix
     """
-    if hasattr(mat, "root_decomposition"):
-        return mat.root_decomposition()
-    else:
-        from ..lazy.non_lazy_tensor import NonLazyTensor
-
-        return NonLazyTensor(mat).root_decomposition()
+    from ..lazy import lazify
+    return lazify(mat).root_decomposition()
 
 
 def root_inv_decomposition(mat, initial_vectors=None, test_vectors=None):
@@ -247,19 +186,13 @@ def root_inv_decomposition(mat, initial_vectors=None, test_vectors=None):
     This can be used for sampling from a Gaussian distribution, or for obtaining a
     low-rank version of a matrix
     """
-    if hasattr(mat, "root_inv_decomposition"):
-        return mat.root_inv_decomposition(initial_vectors, test_vectors)
-    else:
-        from ..lazy.non_lazy_tensor import NonLazyTensor
-
-        return NonLazyTensor(mat).root_inv_decomposition(initial_vectors, test_vectors)
+    from ..lazy import lazify
+    return lazify(mat).root_inv_decomposition(initial_vectors, test_vectors)
 
 
 __all__ = [
     "add_diag",
     "dsmm",
-    "exact_predictive_mean",
-    "exact_predictive_covar",
     "inv_matmul",
     "inv_quad",
     "inv_quad_log_det",

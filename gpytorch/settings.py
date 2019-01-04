@@ -9,6 +9,10 @@ class _feature_flag(object):
         return cls._state
 
     @classmethod
+    def off(cls):
+        return (not cls._state)
+
+    @classmethod
     def _set_state(cls, state):
         cls._state = state
 
@@ -47,6 +51,29 @@ class _value_context(object):
         return False
 
 
+class _fast_covar_root_decomposition(_feature_flag):
+    r"""
+    This feature flag controls how matrix root decompositions (:math:`K = L L^\top`) are computed
+    (e.g. for sampling, computing caches, etc.).
+
+    If set to True, covariance matrices :math:`K` are decomposed with low-rank approximations :math:`L L^\top`,
+    (:math:`L \in \mathbb R^{n \times k}`) using the Lanczos algorithm.
+    This is faster for large matrices and exploits structure in the covariance matrix if applicable.
+
+    If set to False, covariance matrices :math:`K` are decomposed using the Cholesky decomposition.
+
+    .. warning ::
+
+        Setting this to False will compute a complete Cholesky decomposition of covariance matrices.
+        This may be infeasible for GPs with structure covariance matrices.
+
+    See also: :class:`gpytorch.settings.max_root_decomposition_size` (to control the
+    size of the low rank decomposition used).
+    """
+
+    _state = True
+
+
 class check_training_data(_feature_flag):
     """
     Check whether the correct training data is supplied in Exact GP training mode
@@ -59,12 +86,134 @@ class check_training_data(_feature_flag):
     _state = True
 
 
+class detach_test_caches(_feature_flag):
+    """
+    Whether or not to detach caches computed for making predictions. In most cases, you will want this,
+    as this will speed up derivative computations of the predictions with respect to test inputs. However,
+    if you also need derivatives with respect to training inputs (e.g., because you have fantasy observations),
+    then you must disable this.
+    """
+
+    _state = True
+
+
 class debug(_feature_flag):
     """
     Whether or not to perform "safety" checks on the supplied data.
     (For example, that the correct training data is supplied in Exact GP training mode)
     Pros: fewer data checks, fewer warning messages
     Cons: possibility of supplying incorrect data, model accidentially in wrong mode
+    """
+
+    _state = True
+
+
+class fast_pred_var(_feature_flag):
+    """
+    Fast predictive variances using Lanczos Variance Estimates (LOVE)
+    Use this for improved performance when computing predictive variances.
+
+    As described in the paper:
+
+    `Constant-Time Predictive Distributions for Gaussian Processes`_.
+
+    See also: :class:`gpytorch.settings.max_root_decomposition_size` (to control the
+    size of the low rank decomposition used for variance estimates).
+
+    .. _`Constant-Time Predictive Distributions for Gaussian Processes`:
+        https://arxiv.org/pdf/1803.06058.pdf
+    """
+
+    _num_probe_vectors = 1
+
+    @classmethod
+    def num_probe_vectors(cls):
+        return cls._num_probe_vectors
+
+    @classmethod
+    def _set_num_probe_vectors(cls, value):
+        cls._num_probe_vectors = value
+
+    def __init__(self, state=True, num_probe_vectors=1):
+        self.orig_value = self.__class__.num_probe_vectors()
+        self.value = num_probe_vectors
+        super(fast_pred_var, self).__init__(state)
+
+    def __enter__(self):
+        self.__class__._set_num_probe_vectors(self.value)
+        super(fast_pred_var, self).__enter__()
+
+    def __exit__(self, *args):
+        self.__class__._set_num_probe_vectors(self.orig_value)
+        return super(fast_pred_var, self).__exit__()
+
+
+class fast_pred_samples(_feature_flag):
+    """
+    Fast predictive samples using Lanczos Variance Estimates (LOVE).
+    Use this for improved performance when sampling from a predictive posterior matrix.
+
+    As described in the paper:
+
+    `Constant-Time Predictive Distributions for Gaussian Processes`_.
+
+    See also: :class:`gpytorch.settings.max_root_decomposition_size` (to control the
+    size of the low rank decomposition used for samples).
+
+    .. _`Constant-Time Predictive Distributions for Gaussian Processes`:
+        https://arxiv.org/pdf/1803.06058.pdf
+    """
+
+    pass
+
+
+class fast_computations(object):
+    r"""
+    This feature flag controls whether or not to use fast approximations to various mathematical
+    functions used in GP inference.
+    The functions that can be controlled are:
+
+    * :attr:`covar_root_decomposition` - This feature flag controls how matrix root decompositions
+        (:math:`K = L L^\top`) are computed (e.g. for sampling, computing caches, etc.).
+
+        * If set to True, covariance matrices :math:`K` are decomposed with low-rank approximations :math:`L L^\top`,
+            (:math:`L \in \mathbb R^{n \times k}`) using the Lanczos algorithm.
+            This is faster for large matrices and exploits structure in the covariance matrix if applicable.
+
+        * If set to False, covariance matrices :math:`K` are decomposed using the Cholesky decomposition.
+
+    By default, approximations are used for all of these functions. Setting any of them to False will use
+    exact computations instead.
+
+    .. warning ::
+
+        Setting any of these options to False will compute a complete Cholesky decomposition of covariance matrices.
+        This may be infeasible for GPs with structure covariance matrices.
+
+    See also: :class:`gpytorch.settings.max_root_decomposition_size` (to control the
+    size of the low rank decomposition used).
+    """
+    covar_root_decomposition = _fast_covar_root_decomposition
+
+    def __init__(self, covar_root_decomposition=True):
+        self.covar_root_decomposition = _fast_covar_root_decomposition(covar_root_decomposition)
+
+    def __enter__(self):
+        self.covar_root_decomposition.__enter__()
+
+    def __exit__(self, *args):
+        self.covar_root_decomposition.__exit__()
+        return False
+
+
+class lazily_evaluate_kernels(_feature_flag):
+    """
+    Lazily compute the entries of covariance matrices (set to True by default).
+    This can result in memory and speed savings - if say cross covariance terms are not needed
+    or if you only need to compute variances (not covariances).
+
+    If set to False, gpytorch will always compute the entire covariance matrix between
+    training and test data.
     """
 
     _state = True
@@ -185,6 +334,17 @@ class terminate_cg_by_size(_feature_flag):
     """
 
     _state = True
+
+
+class tridiagonal_jitter(_value_context):
+    """
+    The (relative) amount of noise to add to the diagonal of tridiagonal matrices before
+    eigendecomposing. root_decomposition becomes slightly more stable with this, as we need
+    to take the square root of the eigenvalues. Any eigenvalues still negative after adding jitter
+    will be zeroed out.
+    """
+
+    _global_value = 1e-6
 
 
 class use_toeplitz(_feature_flag):

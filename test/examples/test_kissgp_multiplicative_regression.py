@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from math import exp, pi
+from math import pi
 
 import os
 import random
@@ -40,9 +40,9 @@ class GPRegressionModel(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood):
         super(GPRegressionModel, self).__init__(train_x, train_y, likelihood)
         self.mean_module = ConstantMean(prior=SmoothedBoxPrior(-1, 1))
-        self.base_covar_module = ScaleKernel(RBFKernel(lengthscale_prior=SmoothedBoxPrior(exp(-3), exp(3), sigma=0.1)))
+        self.base_covar_module = ScaleKernel(RBFKernel())
         self.covar_module = ProductStructureKernel(
-            GridInterpolationKernel(self.base_covar_module, grid_size=100, num_dims=2), num_dims=2
+            GridInterpolationKernel(self.base_covar_module, grid_size=100, num_dims=1), num_dims=2
         )
 
     def forward(self, x):
@@ -94,7 +94,7 @@ class TestKISSGPMultiplicativeRegression(unittest.TestCase):
         gp_model.eval()
         likelihood.eval()
 
-        with gpytorch.fast_pred_var():
+        with gpytorch.settings.fast_pred_var():
             test_preds = likelihood(gp_model(test_x)).mean
         mean_abs_error = torch.mean(torch.abs(test_y - test_preds))
         self.assertLess(mean_abs_error.squeeze().item(), 0.15)

@@ -3,26 +3,17 @@
 import torch
 import unittest
 from gpytorch.lazy import KroneckerProductLazyTensor, NonLazyTensor
-from test.lazy._lazy_tensor_test_case import LazyTensorTestCase, BatchLazyTensorTestCase
-from test.lazy._lazy_tensor_test_case import RectangularLazyTensorTestCase, RectangularBatchLazyTensorTestCase
+from test.lazy._lazy_tensor_test_case import LazyTensorTestCase, RectangularLazyTensorTestCase
 
 
 def kron(a, b):
     res = []
-    if b.ndimension() == 2:
-        for i in range(b.size(0)):
-            row_res = []
-            for j in range(b.size(1)):
-                row_res.append(a * b[i, j])
-            res.append(torch.cat(row_res, 1))
-        return torch.cat(res, 0)
-    else:
-        for i in range(b.size(1)):
-            row_res = []
-            for j in range(b.size(2)):
-                row_res.append(a * b[:, i, j].unsqueeze(1).unsqueeze(2))
-            res.append(torch.cat(row_res, 2))
-        return torch.cat(res, 1)
+    for i in range(a.size(-2)):
+        row_res = []
+        for j in range(a.size(-1)):
+            row_res.append(b * a[..., i, j].unsqueeze(-1).unsqueeze(-2))
+        res.append(torch.cat(row_res, -1))
+    return torch.cat(res, -2)
 
 
 class TestKroneckerProductLazyTensor(LazyTensorTestCase, unittest.TestCase):
@@ -42,7 +33,7 @@ class TestKroneckerProductLazyTensor(LazyTensorTestCase, unittest.TestCase):
         return res
 
 
-class TestKroneckerProductLazyTensorBatch(BatchLazyTensorTestCase, unittest.TestCase):
+class TestKroneckerProductLazyTensorBatch(LazyTensorTestCase, unittest.TestCase):
     def create_lazy_tensor(self):
         a = torch.tensor([[4, 0, 2], [0, 3, -1], [2, -1, 3]], dtype=torch.float).repeat(3, 1, 1)
         b = torch.tensor([[2, 1], [1, 2]], dtype=torch.float).repeat(3, 1, 1)
@@ -73,7 +64,7 @@ class TestKroneckerProductLazyTensorRectangular(RectangularLazyTensorTestCase, u
         return res
 
 
-class TestKroneckerProductLazyTensorRectangularBatch(RectangularBatchLazyTensorTestCase, unittest.TestCase):
+class TestKroneckerProductLazyTensorRectangularBatch(RectangularLazyTensorTestCase, unittest.TestCase):
     def create_lazy_tensor(self):
         a = torch.randn(4, 2, 3, requires_grad=True)
         b = torch.randn(4, 5, 2, requires_grad=True)
